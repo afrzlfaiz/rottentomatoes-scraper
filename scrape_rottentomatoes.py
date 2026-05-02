@@ -20,7 +20,7 @@ init(autoreset=True)
 
 
 MOVIE_REVIEWS_URL = "https://www.rottentomatoes.com/napi/rtcf/v1/movies/{movie_id}/reviews"
-TV_SEASON_URL = "https://www.rottentomatoes.com/napi/rtcf/v1/tv/seasons/{movie_id}"
+TV_SEASON_REVIEWS_URL = "https://www.rottentomatoes.com/napi/rtcf/v1/tv/seasons/{movie_id}/reviews"
 PROPS_PATTERN = re.compile(
     r'<script\s+data-json="props"\s+type="application/json">\s*(\{.*?\})\s*</script>',
     re.DOTALL,
@@ -117,7 +117,7 @@ def fetch_page(
         "verified": str(verified).lower(),
     }
     if content_type == "tv":
-        url = TV_SEASON_URL.format(movie_id=movie_id)
+        url = f"{TV_SEASON_REVIEWS_URL.format(movie_id=movie_id)}?{urlencode(params)}"
     else:
         url = f"{MOVIE_REVIEWS_URL.format(movie_id=movie_id)}?{urlencode(params)}"
 
@@ -132,6 +132,11 @@ def fetch_page(
     try:
         with urlopen(request) as response:
             data = json.load(response)
+            if isinstance(data, list):
+                data = {
+                    "reviews": [item for item in data if isinstance(item, dict)],
+                    "pageInfo": {"hasNextPage": False, "endCursor": ""},
+                }
             return data
     except HTTPError as e:
         logger.log("ERROR", f"HTTP Error {e.code}: {e.reason}", "❌")
@@ -166,6 +171,37 @@ def normalize_rt_url(rt_url: str) -> str:
         raise ValueError("Invalid Rotten Tomatoes URL path.")
 
     return f"https://www.rottentomatoes.com{path}"
+
+
+def is_tv_url(rt_url: str) -> bool:
+    path = urlparse(normalize_rt_url(rt_url)).path.rstrip("/")
+    return path.startswith("/tv/")
+
+
+def tv_url_has_season(rt_url: str) -> bool:
+    path = urlparse(normalize_rt_url(rt_url)).path.rstrip("/")
+    return bool(re.search(r"/s\d{1,2}$", path))
+
+
+def append_tv_season(rt_url: str, season: int) -> str:
+    base_url = normalize_rt_url(rt_url)
+    if season <= 0:
+        raise ValueError("Season number must be greater than 0.")
+    return f"{base_url}/s{season:02d}"
+
+
+def ensure_tv_season_url(rt_url: str, interactive: bool) -> str:
+    normalized = normalize_rt_url(rt_url)
+    if not is_tv_url(normalized) or tv_url_has_season(normalized):
+        return normalized
+
+    if not interactive:
+        raise ValueError("TV show URL must include season path (example: /s01).")
+
+    season = prompt_positive_int("TV show detected. Which season number? ")
+    season_url = append_tv_season(normalized, season)
+    logger.log("INFO", f"Using TV season URL: {season_url}", "📺")
+    return season_url
 
 
 def resolve_movie_id_from_url(rt_url: str) -> tuple[str, str]:
@@ -277,7 +313,7 @@ def fetch_reviews(
         page_num += 1
         time.sleep(0.5)  # Small delay to avoid rate limiting
 
-    logger.log("SUCCESS", f"Selesai: {len(reviews)}/{max_reviews} review {review_type} berhasil diambil", "✅")
+    logger.log("SUCCESS", f"Completed: {len(reviews)}/{max_reviews} {review_type} reviews fetched", "✅")
     return reviews[:max_reviews]
 
 
@@ -317,7 +353,7 @@ def prompt_choice(message: str, options: dict[str, str]) -> str:
         print(f"{Colors.INFO}{message}{Style.RESET_ALL}")
         for key, label in options.items():
             print(f"{Colors.HIGHLIGHT}{key}. {Style.RESET_ALL}{label}")
-        choice = input(f"{Colors.INFO}Pilih nomor: {Style.RESET_ALL}").strip()
+        choice = input(f"{Colors.INFO}Choose a number: {Style.RESET_ALL}").strip()
         if choice in options:
             return choice
         error_message = "Invalid choice."
@@ -423,6 +459,7 @@ def prompt_interactive_inputs() -> dict[str, Any]:
     source_url = prompt_non_empty("Enter Rotten Tomatoes movie URL: ")
     # Resolve movie ID immediately after URL input
     try:
+        source_url = ensure_tv_season_url(source_url, interactive=True)
         movie_id, _ = resolve_movie_id_from_url(source_url)
         logger.log("SUCCESS", f"Content ID: {movie_id}", "🎯")
     except Exception as e:
@@ -514,7 +551,9 @@ def main() -> None:
     else:
         movie_id = args.movie_id
     source_url = args.url or interactive_inputs.get("url")
-    content_type = "tv" if source_url and urlparse(normalize_rt_url(source_url)).path.startswith("/tv/") else "movie"
+    if source_url and not interactive_mode:
+        source_url = ensure_tv_season_url(source_url, interactive=False)
+    content_type = "tv" if source_url and is_tv_url(source_url) else "movie"
     review_type_arg = interactive_inputs.get("type", args.type)
     count = interactive_inputs.get("count", args.count)
     output_base = interactive_inputs.get("output", args.output)
@@ -572,7 +611,7 @@ def main() -> None:
 
         written_files = export_reviews(output_base, output_format, result)
 
-        logger.log("SUCCESS", "File output berhasil dibuat:", "✅")
+        logger.log("SUCCESS", "Output files created:", "✅")
         for file_path in written_files:
             print(f"  {Colors.SUCCESS}✓ {file_path}{Style.RESET_ALL}")
 
@@ -587,7 +626,7 @@ def main() -> None:
         return
 
     # Print JSON result with colors
-    logger.log("INFO", "Menampilkan hasil dalam format JSON:", "📋")
+    logger.log("INFO", "Displaying results in JSON format:", "📋")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
     # Show completion message
