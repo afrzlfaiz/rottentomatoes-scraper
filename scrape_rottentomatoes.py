@@ -204,7 +204,7 @@ def ensure_tv_season_url(rt_url: str, interactive: bool) -> str:
     return season_url
 
 
-def resolve_movie_id_from_url(rt_url: str) -> tuple[str, str]:
+def resolve_movie_id_from_url(rt_url: str) -> tuple[str, str, str | None]:
     base_url = normalize_rt_url(rt_url)
     reviews_url = f"{base_url}/reviews/all-audience"
 
@@ -221,12 +221,15 @@ def resolve_movie_id_from_url(rt_url: str) -> tuple[str, str]:
     props = json.loads(match.group(1))
     media = props.get("media") or {}
     movie_id = media.get("emsId")
+    title = media.get("title")
     if not movie_id:
         logger.log("ERROR", "emsId not found on audience review page")
         raise ValueError("emsId not found on audience review page.")
 
     logger.log("SUCCESS", f"Content ID found: {movie_id}", "🎯")
-    return str(movie_id), reviews_url
+    if title:
+        logger.log("SUCCESS", f"Title found: {title}", "🎬")
+    return str(movie_id), reviews_url, title
 
 
 def slug_from_url(rt_url: str) -> str:
@@ -399,11 +402,21 @@ def write_csv(base_path: Path, payload: dict[str, Any]) -> list[Path]:
         logger.log("INFO", f"Writing CSV for {review_type} reviews...", "📊")
         output_path = base_path.with_name(f"{base_stem}_{review_type}{suffix}")
         ensure_parent_dir(output_path)
-        fieldnames = list(rows[0].keys()) if rows else ["type"]
+
+        enriched_rows = [
+            {
+                "title": payload.get("title"),
+                "movie_id": payload.get("movie_id"),
+                **row,
+            }
+            for row in rows
+        ]
+
+        fieldnames = list(enriched_rows[0].keys()) if enriched_rows else ["title", "movie_id", "type"]
         with output_path.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(enriched_rows)
         written_files.append(output_path)
         logger.log("SUCCESS", f"CSV written: {output_path}", "✅")
 
@@ -420,9 +433,19 @@ def write_excel(output_path: Path, payload: dict[str, Any]) -> None:
     for review_type, rows in payload["reviews"].items():
         logger.log("INFO", f"Creating sheet for {review_type} reviews...", "📊")
         sheet = workbook.create_sheet(title=review_type[:31])
-        headers = list(rows[0].keys()) if rows else ["type"]
+
+        enriched_rows = [
+            {
+                "title": payload.get("title"),
+                "movie_id": payload.get("movie_id"),
+                **row,
+            }
+            for row in rows
+        ]
+
+        headers = list(enriched_rows[0].keys()) if enriched_rows else ["title", "movie_id", "type"]
         sheet.append(headers)
-        for row in rows:
+        for row in enriched_rows:
             sheet.append([row.get(header) for header in headers])
 
     workbook.save(output_path)
@@ -434,23 +457,38 @@ def export_reviews(output_base: str, output_format: str, payload: dict[str, Any]
     written_files: list[Path] = []
 
     if output_format in {"json", "all"}:
-        logger.log("INFO", "Exporting JSON file...", "📄")
-        json_path = base_path if base_path.suffix.lower() == ".json" else base_path.with_suffix(".json")
-        write_json(json_path, payload)
-        written_files.append(json_path)
-        logger.log("SUCCESS", f"JSON file saved: {json_path}", "✅")
+        logger.log("INFO", "Exporting JSON files...", "📄")
+        json_base = base_path.with_suffix("") if base_path.suffix.lower() == ".json" else base_path
+        for review_type, rows in payload["reviews"].items():
+            json_path = json_base.with_name(f"{json_base.name}_{review_type}").with_suffix(".json")
+            json_payload = {
+                **payload,
+                "review_types": [review_type],
+                "reviews": {review_type: rows},
+            }
+            write_json(json_path, json_payload)
+            written_files.append(json_path)
+            logger.log("SUCCESS", f"JSON file saved: {json_path}", "✅")
 
     if output_format in {"csv", "all"}:
         logger.log("INFO", "Exporting CSV files...", "📊")
+        csv_before = len(written_files)
         written_files.extend(write_csv(base_path, payload))
-        logger.log("SUCCESS", f"CSV files saved: {len(written_files) - (1 if output_format in {'json', 'all'} else 0)} files", "✅")
+        logger.log("SUCCESS", f"CSV files saved: {len(written_files) - csv_before} files", "✅")
 
     if output_format in {"excel", "all"}:
-        logger.log("INFO", "Exporting Excel file...", "📈")
-        excel_path = base_path if base_path.suffix.lower() == ".xlsx" else base_path.with_suffix(".xlsx")
-        write_excel(excel_path, payload)
-        written_files.append(excel_path)
-        logger.log("SUCCESS", f"Excel file saved: {excel_path}", "✅")
+        logger.log("INFO", "Exporting Excel files...", "📈")
+        excel_base = base_path.with_suffix("") if base_path.suffix.lower() == ".xlsx" else base_path
+        for review_type, rows in payload["reviews"].items():
+            excel_path = excel_base.with_name(f"{excel_base.name}_{review_type}").with_suffix(".xlsx")
+            excel_payload = {
+                **payload,
+                "review_types": [review_type],
+                "reviews": {review_type: rows},
+            }
+            write_excel(excel_path, excel_payload)
+            written_files.append(excel_path)
+            logger.log("SUCCESS", f"Excel file saved: {excel_path}", "✅")
 
     return written_files
 
@@ -460,8 +498,10 @@ def prompt_interactive_inputs() -> dict[str, Any]:
     # Resolve movie ID immediately after URL input
     try:
         source_url = ensure_tv_season_url(source_url, interactive=True)
-        movie_id, _ = resolve_movie_id_from_url(source_url)
+        movie_id, _, title = resolve_movie_id_from_url(source_url)
         logger.log("SUCCESS", f"Content ID: {movie_id}", "🎯")
+        if title:
+            logger.log("SUCCESS", f"Title: {title}", "🎬")
     except Exception as e:
         logger.log("ERROR", f"Failed to resolve movie ID: {e}", "❌")
         sys.exit(1)
@@ -480,6 +520,7 @@ def prompt_interactive_inputs() -> dict[str, Any]:
     output_format_map = {"1": "json", "2": "csv", "3": "excel", "4": "all"}
     return {
         "movie_id": movie_id,
+        "title": title,
         "url": source_url,
         "type": review_type_map[review_type_choice],
         "count": count,
@@ -492,6 +533,7 @@ def show_interactive_summary(inputs: dict[str, Any]) -> None:
     render_header()
     logger.log("HEADER", "Configuration Summary:", "📋")
     print(f"{Colors.INFO}• URL: {Style.RESET_ALL}{inputs['url']}")
+    print(f"{Colors.INFO}• Title: {Style.RESET_ALL}{inputs.get('title') or '-'}")
     print(f"{Colors.INFO}• Review type: {Style.RESET_ALL}{inputs['type']}")
     print(f"{Colors.INFO}• Number of reviews: {Style.RESET_ALL}{inputs['count']}")
     print(f"{Colors.INFO}• Base output: {Style.RESET_ALL}{inputs['output']}")
@@ -551,6 +593,7 @@ def main() -> None:
     else:
         movie_id = args.movie_id
     source_url = args.url or interactive_inputs.get("url")
+    movie_title = interactive_inputs.get("title")
     if source_url and not interactive_mode:
         source_url = ensure_tv_season_url(source_url, interactive=False)
     content_type = "tv" if source_url and is_tv_url(source_url) else "movie"
@@ -567,8 +610,10 @@ def main() -> None:
     try:
         if not movie_id:
             logger.log("INFO", "Fetching movie ID from URL...", "🔍")
-            movie_id, reviews_url = resolve_movie_id_from_url(source_url)
+            movie_id, reviews_url, movie_title = resolve_movie_id_from_url(source_url)
             logger.log("SUCCESS", f"Content ID: {movie_id}", "🎯")
+            if movie_title:
+                logger.log("SUCCESS", f"Title: {movie_title}", "🎬")
             logger.log("INFO", f"Source: {reviews_url}", "📄")
         else:
             reviews_url = None
@@ -598,6 +643,7 @@ def main() -> None:
 
     result = {
         "movie_id": movie_id,
+        "title": movie_title,
         "movie_url": source_url,
         "source_reviews_url": reviews_url,
         "requested_count": count,
