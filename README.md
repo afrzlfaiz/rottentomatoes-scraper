@@ -9,6 +9,9 @@ A Python CLI tool to scrape Rotten Tomatoes reviews (audience and critic) and ex
   - `audience`
   - `critic`
   - `both`
+- **Batch scraping** — scrape multiple films/shows in one run, results appended to the same output file
+  - Interactive: enter first film with full settings, then loop "Add another?" with URL + count only
+  - CLI: `--batch-file` with a text file of URLs (one per line)
 - Interactive mode (no arguments)
 - Export formats:
   - `json`
@@ -63,6 +66,7 @@ python scrape_rottentomatoes.py [movie_id] [options]
 ### Options
 
 - `--url` Rotten Tomatoes URL (movie or TV)
+- `--batch-file <path>` text file with one RT URL per line for batch scraping (all films use the same `--type`, `--count`, `--format`)
 - `--type {audience,critic,both}` (default: `both`)
 - `--count <int>` number of reviews per type (default: `20`)
 - `--verified` audience only: fetch verified reviews only
@@ -84,17 +88,26 @@ Fetch critic reviews by movie ID and save JSON:
 python scrape_rottentomatoes.py 771306662 --type critic --count 30 --output output/critic_reviews --format json
 ```
 
-Run without arguments (interactive mode):
+Batch scrape multiple films from a file (all use same `--type`, `--count`, `--format`; results appended row-by-row):
+
+```bash
+python scrape_rottentomatoes.py --batch-file urls.txt --type critic --count 30 --output output/batch_critics --format csv
+```
+
+Run without arguments (interactive mode with batch support):
 
 ```bash
 python scrape_rottentomatoes.py
 ```
+
+In interactive mode you'll enter the first film's URL, choose review type/format/output, then optionally add more films (URL + count each) whose results are appended to the same file.
 
 ## Output Notes
 
 - `json`: single JSON file
 - `csv`: one CSV file per review type (e.g. `reviews_audience.csv`, `reviews_critic.csv`)
 - `excel`: one `.xlsx` file with separate sheets per review type
+- **Batch mode**: the first film creates the output file with headers; subsequent films append rows without re-adding headers. All films in a batch share the same review type to keep column format consistent.
 
 ## Disclaimer
 

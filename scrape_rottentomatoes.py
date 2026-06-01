@@ -10,7 +10,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from colorama import init, Fore, Style, Back
 from datetime import datetime
 import time
@@ -393,7 +393,7 @@ def write_json(output_path: Path, payload: dict[str, Any]) -> None:
     logger.log("SUCCESS", "JSON file written successfully", "✅")
 
 
-def write_csv(base_path: Path, payload: dict[str, Any]) -> list[Path]:
+def write_csv(base_path: Path, payload: dict[str, Any], append_mode: bool = False) -> list[Path]:
     written_files: list[Path] = []
     base_stem = base_path.stem
     suffix = base_path.suffix if base_path.suffix.lower() == ".csv" else ".csv"
@@ -413,26 +413,36 @@ def write_csv(base_path: Path, payload: dict[str, Any]) -> list[Path]:
         ]
 
         fieldnames = list(enriched_rows[0].keys()) if enriched_rows else ["title", "movie_id", "type"]
-        with output_path.open("w", newline="", encoding="utf-8-sig") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(enriched_rows)
+
+        if append_mode and output_path.exists():
+            with output_path.open("a", newline="", encoding="utf-8-sig") as file:
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
+                writer.writerows(enriched_rows)
+        else:
+            with output_path.open("w", newline="", encoding="utf-8-sig") as file:
+                writer = csv.DictWriter(file, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(enriched_rows)
         written_files.append(output_path)
-        logger.log("SUCCESS", f"CSV written: {output_path}", "✅")
+        logger.log("SUCCESS", f"CSV {'appended to' if append_mode else 'written'}: {output_path}", "✅")
 
     return written_files
 
 
-def write_excel(output_path: Path, payload: dict[str, Any]) -> None:
+def write_excel(output_path: Path, payload: dict[str, Any], append_mode: bool = False) -> None:
     logger.log("INFO", f"Writing Excel to {output_path}...", "📈")
     ensure_parent_dir(output_path)
-    workbook = Workbook()
-    default_sheet = workbook.active
-    workbook.remove(default_sheet)
+
+    if append_mode and output_path.exists():
+        workbook = load_workbook(output_path)
+    else:
+        workbook = Workbook()
+        default_sheet = workbook.active
+        workbook.remove(default_sheet)
 
     for review_type, rows in payload["reviews"].items():
         logger.log("INFO", f"Creating sheet for {review_type} reviews...", "📊")
-        sheet = workbook.create_sheet(title=review_type[:31])
+        sheet_name = review_type[:31]
 
         enriched_rows = [
             {
@@ -443,8 +453,17 @@ def write_excel(output_path: Path, payload: dict[str, Any]) -> None:
             for row in rows
         ]
 
-        headers = list(enriched_rows[0].keys()) if enriched_rows else ["title", "movie_id", "type"]
-        sheet.append(headers)
+        if not enriched_rows:
+            continue
+
+        headers = list(enriched_rows[0].keys())
+
+        if sheet_name in workbook.sheetnames:
+            sheet = workbook[sheet_name]
+        else:
+            sheet = workbook.create_sheet(title=sheet_name)
+            sheet.append(headers)
+
         for row in enriched_rows:
             sheet.append([row.get(header) for header in headers])
 
@@ -452,7 +471,7 @@ def write_excel(output_path: Path, payload: dict[str, Any]) -> None:
     logger.log("SUCCESS", "Excel file written successfully", "✅")
 
 
-def export_reviews(output_base: str, output_format: str, payload: dict[str, Any]) -> list[Path]:
+def export_reviews(output_base: str, output_format: str, payload: dict[str, Any], append_mode: bool = False) -> list[Path]:
     base_path = Path(output_base)
     written_files: list[Path] = []
 
@@ -473,7 +492,7 @@ def export_reviews(output_base: str, output_format: str, payload: dict[str, Any]
     if output_format in {"csv", "all"}:
         logger.log("INFO", "Exporting CSV files...", "📊")
         csv_before = len(written_files)
-        written_files.extend(write_csv(base_path, payload))
+        written_files.extend(write_csv(base_path, payload, append_mode=append_mode))
         logger.log("SUCCESS", f"CSV files saved: {len(written_files) - csv_before} files", "✅")
 
     if output_format in {"excel", "all"}:
@@ -486,25 +505,27 @@ def export_reviews(output_base: str, output_format: str, payload: dict[str, Any]
                 "review_types": [review_type],
                 "reviews": {review_type: rows},
             }
-            write_excel(excel_path, excel_payload)
+            write_excel(excel_path, excel_payload, append_mode=append_mode)
             written_files.append(excel_path)
             logger.log("SUCCESS", f"Excel file saved: {excel_path}", "✅")
 
     return written_files
 
 
-def prompt_interactive_inputs() -> dict[str, Any]:
-    source_url = prompt_non_empty("Enter Rotten Tomatoes movie URL: ")
-    # Resolve movie ID immediately after URL input
-    try:
+def prompt_interactive_batch() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+
+    def _resolve_url(prompt_text: str) -> tuple[str, str, str | None]:
+        source_url = prompt_non_empty(prompt_text)
         source_url = ensure_tv_season_url(source_url, interactive=True)
         movie_id, _, title = resolve_movie_id_from_url(source_url)
         logger.log("SUCCESS", f"Content ID: {movie_id}", "🎯")
         if title:
             logger.log("SUCCESS", f"Title: {title}", "🎬")
-    except Exception as e:
-        logger.log("ERROR", f"Failed to resolve movie ID: {e}", "❌")
-        sys.exit(1)
+        return movie_id, title, source_url
+
+    movie_id, title, source_url = _resolve_url("Enter Rotten Tomatoes movie URL: ")
+
     review_type_choice = prompt_choice(
         "Select review type:",
         {"1": "audience", "2": "critic", "3": "both"},
@@ -518,37 +539,117 @@ def prompt_interactive_inputs() -> dict[str, Any]:
 
     review_type_map = {"1": "audience", "2": "critic", "3": "both"}
     output_format_map = {"1": "json", "2": "csv", "3": "excel", "4": "all"}
-    return {
+
+    targets.append({
         "movie_id": movie_id,
         "title": title,
         "url": source_url,
-        "type": review_type_map[review_type_choice],
         "count": count,
-        "output": output_base,
+    })
+
+    while True:
+        add_another = prompt_choice(
+            "Add another film/TV show?",
+            {"1": "Yes, add another", "2": "No, start scraping"},
+        )
+        if add_another == "2":
+            break
+
+        movie_id, title, source_url = _resolve_url("Enter Rotten Tomatoes URL for next film/TV show: ")
+        count = prompt_positive_int("Number of reviews to fetch: ")
+
+        targets.append({
+            "movie_id": movie_id,
+            "title": title,
+            "url": source_url,
+            "count": count,
+        })
+
+    common_settings = {
+        "type": review_type_map[review_type_choice],
         "format": output_format_map[output_format_choice],
+        "output": output_base,
     }
+    return targets, common_settings
 
 
-def show_interactive_summary(inputs: dict[str, Any]) -> None:
+def show_batch_summary(targets: list[dict[str, Any]], settings: dict[str, Any]) -> None:
     render_header()
-    logger.log("HEADER", "Configuration Summary:", "📋")
-    print(f"{Colors.INFO}• URL: {Style.RESET_ALL}{inputs['url']}")
-    print(f"{Colors.INFO}• Title: {Style.RESET_ALL}{inputs.get('title') or '-'}")
-    print(f"{Colors.INFO}• Review type: {Style.RESET_ALL}{inputs['type']}")
-    print(f"{Colors.INFO}• Number of reviews: {Style.RESET_ALL}{inputs['count']}")
-    print(f"{Colors.INFO}• Base output: {Style.RESET_ALL}{inputs['output']}")
-    print(f"{Colors.INFO}• Format output: {Style.RESET_ALL}{inputs['format']}")
+    logger.log("HEADER", "Batch Configuration Summary:", "📋")
+    print(f"{Colors.INFO}• Review type: {Style.RESET_ALL}{settings['type']}")
+    print(f"{Colors.INFO}• Output format: {Style.RESET_ALL}{settings['format']}")
+    print(f"{Colors.INFO}• Output file base: {Style.RESET_ALL}{settings['output']}")
     print()
-
+    for i, t in enumerate(targets, 1):
+        print(f"{Colors.HIGHLIGHT}  #{i} {Style.RESET_ALL}{t['title'] or '-'}  ({t['count']} reviews)")
+        print(f"      {Colors.INFO}{t['url']}{Style.RESET_ALL}")
+    print()
     logger.log("INFO", "Press Enter to start scraping...", "🚀")
     input()
+
+
+def _scrape_one_film(
+    target: dict[str, Any],
+    common_settings: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    movie_id = target.get("movie_id")
+    source_url = target.get("url")
+    title = target.get("title")
+    count = target.get("count")
+    review_type_arg = common_settings["type"]
+    interactive = common_settings.get("interactive", False)
+
+    if source_url:
+        source_url = ensure_tv_season_url(source_url, interactive=interactive)
+        content_type = "tv" if is_tv_url(source_url) else "movie"
+    else:
+        content_type = "movie"
+
+    if not movie_id and source_url:
+        logger.log("INFO", "Fetching movie ID from URL...", "🔍")
+        movie_id, reviews_url, title = resolve_movie_id_from_url(source_url)
+        logger.log("SUCCESS", f"Content ID: {movie_id}", "🎯")
+        if title:
+            logger.log("SUCCESS", f"Title: {title}", "🎬")
+    elif not movie_id:
+        raise ValueError("Neither movie_id nor URL provided for target")
+    else:
+        reviews_url = None
+        logger.log("INFO", f"Processing: {title or movie_id}", "🎬")
+
+    review_types = [review_type_arg] if review_type_arg != "both" else ["audience", "critic"]
+    reviews = {
+        review_type: fetch_reviews(
+            movie_id=movie_id,
+            content_type=content_type,
+            review_type=review_type,
+            max_reviews=count,
+            verified=args.verified if review_type == "audience" else False,
+            top_only=args.top_only,
+        )
+        for review_type in review_types
+    }
+
+    result = {
+        "movie_id": movie_id,
+        "title": title,
+        "movie_url": source_url,
+        "source_reviews_url": reviews_url,
+        "requested_count": count,
+        "review_types": review_types,
+        "reviews": reviews,
+    }
+
+    total_reviews = sum(len(reviews[rt]) for rt in reviews)
+    logger.log("SUCCESS", f"{title or movie_id}: {total_reviews} reviews fetched", "✅")
+    return result
 
 
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    # Show welcome message
     render_header()
     logger.log("HEADER", "🍅 Rotten Tomatoes Scraper - Modern Version", "🎬")
     logger.log("INFO", "Script to scrape reviews from Rotten Tomatoes", "📊")
@@ -565,12 +666,16 @@ def main() -> None:
     )
     parser.add_argument("--url", help="Rotten Tomatoes movie URL, example: https://www.rottentomatoes.com/m/lee_cronins_the_mummy")
     parser.add_argument(
+        "--batch-file",
+        help="Text file with one Rotten Tomatoes URL per line for batch scraping (CLI mode only)",
+    )
+    parser.add_argument(
         "--type",
         choices=["audience", "critic", "both"],
         default="both",
         help="Type of reviews to fetch",
     )
-    parser.add_argument("--count", type=int, default=20, help="Number of reviews to fetch per type")
+    parser.add_argument("--count", type=int, default=20, help="Number of reviews to fetch per film/type")
     parser.add_argument("--verified", action="store_true", help="Audience only: fetch verified reviews only")
     parser.add_argument("--top-only", action="store_true", help="Fetch top reviews only if available")
     parser.add_argument("--output", help="Base output file path. If empty in interactive mode, will be prompted")
@@ -582,105 +687,85 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    interactive_mode = not args.movie_id and not args.url
-    interactive_inputs: dict[str, Any] = {}
+    interactive_mode = not args.movie_id and not args.url and not args.batch_file
+
     if interactive_mode:
         logger.log("INFO", "Interactive mode enabled", "🔄")
-        interactive_inputs = prompt_interactive_inputs()
-        show_interactive_summary(interactive_inputs)
-        # Use the resolved movie ID from interactive inputs
-        movie_id = interactive_inputs.get("movie_id")
+        targets, common_settings = prompt_interactive_batch()
+        show_batch_summary(targets, common_settings)
+        common_settings["interactive"] = True
     else:
-        movie_id = args.movie_id
-    source_url = args.url or interactive_inputs.get("url")
-    movie_title = interactive_inputs.get("title")
-    if source_url and not interactive_mode:
-        source_url = ensure_tv_season_url(source_url, interactive=False)
-    content_type = "tv" if source_url and is_tv_url(source_url) else "movie"
-    review_type_arg = interactive_inputs.get("type", args.type)
-    count = interactive_inputs.get("count", args.count)
-    output_base = interactive_inputs.get("output", args.output)
-    output_format = interactive_inputs.get("format", args.format)
+        targets: list[dict[str, Any]] = []
+        if args.batch_file:
+            batch_path = Path(args.batch_file)
+            if not batch_path.exists():
+                logger.log("ERROR", f"Batch file not found: {args.batch_file}", "❌")
+                sys.exit(1)
+            urls = [line.strip() for line in batch_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            logger.log("INFO", f"Loaded {len(urls)} URLs from batch file", "📄")
+            for url in urls:
+                targets.append({"url": url, "count": args.count})
+        elif args.url:
+            targets.append({"url": args.url, "count": args.count})
+        elif args.movie_id:
+            targets.append({"movie_id": args.movie_id, "count": args.count})
 
-    logger.log("INFO", f"Content type: {content_type.upper()}", "📺")
-    logger.log("INFO", f"Review types: {review_type_arg}", "📝")
-    logger.log("INFO", f"Request count: {count} per type", "🔢")
-    logger.log("INFO", f"Output format: {output_format}", "💾")
+        if not args.output:
+            logger.log("ERROR", "--output is required in CLI mode", "❌")
+            sys.exit(1)
 
-    try:
-        if not movie_id:
-            logger.log("INFO", "Fetching movie ID from URL...", "🔍")
-            movie_id, reviews_url, movie_title = resolve_movie_id_from_url(source_url)
-            logger.log("SUCCESS", f"Content ID: {movie_id}", "🎯")
-            if movie_title:
-                logger.log("SUCCESS", f"Title: {movie_title}", "🎬")
-            logger.log("INFO", f"Source: {reviews_url}", "📄")
-        else:
-            reviews_url = None
-            logger.log("INFO", "Using provided movie ID", "🔢")
-
-        review_types = [review_type_arg] if review_type_arg != "both" else ["audience", "critic"]
-        reviews = {
-            review_type: fetch_reviews(
-                movie_id=movie_id,
-                content_type=content_type,
-                review_type=review_type,
-                max_reviews=count,
-                verified=args.verified if review_type == "audience" else False,
-                top_only=args.top_only,
-            )
-            for review_type in review_types
+        common_settings = {
+            "type": args.type,
+            "format": args.format,
+            "output": args.output,
+            "interactive": False,
         }
-    except HTTPError as error:
-        if error.code == 404:
-            logger.log("ERROR", "Film/TV show has no rating on Rotten Tomatoes", "❌")
-        else:
-            logger.log("ERROR", f"HTTP Error {error.code}: {error.reason}", "❌")
-        return
-    except Exception as error:
-        logger.log("ERROR", f"Error: {str(error)}", "❌")
-        return
 
-    result = {
-        "movie_id": movie_id,
-        "title": movie_title,
-        "movie_url": source_url,
-        "source_reviews_url": reviews_url,
-        "requested_count": count,
-        "review_types": review_types,
-        "reviews": reviews,
-    }
+    logger.log("INFO", f"Review type: {common_settings['type']}", "📝")
+    logger.log("INFO", f"Output format: {common_settings['format']}", "💾")
+    logger.log("INFO", f"Total films to process: {len(targets)}", "🎬")
 
-    if output_base:
-        logger.log("INFO", "Saving results to file...", "💾")
-        logger.log_with_spinner("Exporting data", 1.0)
+    all_written_files: list[Path] = []
+    grand_total_reviews = 0
 
-        written_files = export_reviews(output_base, output_format, result)
+    for i, target in enumerate(targets):
+        render_header()
+        logger.log("HEADER", f"Processing [{i+1}/{len(targets)}]", "🎬")
+        append_mode = (i > 0)
+        output_base = common_settings.get("output")
+        output_format = common_settings.get("format", "json")
 
-        logger.log("SUCCESS", "Output files created:", "✅")
-        for file_path in written_files:
-            print(f"  {Colors.SUCCESS}✓ {file_path}{Style.RESET_ALL}")
+        try:
+            result = _scrape_one_film(target, common_settings, args)
+            grand_total_reviews += sum(len(result["reviews"][rt]) for rt in result["reviews"])
 
-        total_reviews = sum(len(reviews[rt]) for rt in reviews)
-        logger.log("SUCCESS", f"Total reviews: {total_reviews}", "📊")
+            if output_base:
+                logger.log("INFO", "Saving results to file...", "💾")
+                logger.log_with_spinner("Exporting data", 1.0)
+                written_files = export_reviews(output_base, output_format, result, append_mode=append_mode)
+                if i == 0:
+                    all_written_files = written_files
+        except HTTPError as error:
+            if error.code == 404:
+                logger.log("ERROR", "Film/TV show has no rating on Rotten Tomatoes", "❌")
+            else:
+                logger.log("ERROR", f"HTTP Error {error.code}: {error.reason}", "❌")
+            continue
+        except Exception as error:
+            logger.log("ERROR", f"Error: {str(error)}", "❌")
+            continue
 
-        # Show completion animation
-        clear_screen()
-        print(Colors.SUCCESS + COMPLETION_ART + Style.RESET_ALL)
-        logger.log("HEADER", "✅ Scraping completed!", "🎬")
-        logger.log("SUCCESS", "Thank you for using the Rotten Tomatoes Scraper!", "🍅")
-        return
-
-    # Print JSON result with colors
-    logger.log("INFO", "Displaying results in JSON format:", "📋")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-
-    # Show completion message
-    total_reviews = sum(len(reviews[rt]) for rt in reviews)
     clear_screen()
     print(Colors.SUCCESS + COMPLETION_ART + Style.RESET_ALL)
     logger.log("HEADER", "✅ Scraping completed!", "🎬")
-    logger.log("SUCCESS", f"Total reviews: {total_reviews}", "📊")
+    logger.log("SUCCESS", f"Total films: {len(targets)}", "🎬")
+    logger.log("SUCCESS", f"Total reviews: {grand_total_reviews}", "📊")
+    if all_written_files:
+        logger.log("SUCCESS", "Output files:", "📁")
+        for file_path in all_written_files:
+            print(f"  {Colors.SUCCESS}✓ {file_path}{Style.RESET_ALL}")
+    elif not output_base:
+        logger.log("INFO", "No output file specified, results not saved to disk", "ℹ️")
     logger.log("SUCCESS", "Thank you for using the Rotten Tomatoes Scraper!", "🍅")
 
 
